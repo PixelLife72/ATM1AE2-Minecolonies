@@ -1,0 +1,216 @@
+-- AE2 -> MineColonies rack supplier (ME Bridge touches rack)
+local CFG = {
+  rackSide  = "up",    -- face of the ME Bridge touching the rack
+  scanDelay = 20,
+  craftCooldown = 120,
+  maxCraft  = 64,
+}
+
+local bridge = peripheral.find("me_bridge")
+local mon = peripheral.find("monitor")
+assert(bridge, "No me_bridge found")
+
+local colony
+for _, name in ipairs(peripheral.getNames()) do
+  if peripheral.getType(name) == "colony_integrator" then
+    local p = peripheral.wrap(name)
+    local ok, inCol = pcall(p.isInColony)
+    if ok and inCol then colony = p print("Using " .. name) break end
+  end
+end
+assert(colony, "No colony_integrator inside a colony")
+
+local delivered, lastCraft = {}, {}
+local shown = {}
+local page = 1
+local dumped = false
+
+---------------- HELPERS ----------------
+local function hasData(v)
+  if v == nil or v == false or v == "" then return false end
+  if type(v) == "table" then return next(v) ~= nil end
+  return true
+end
+
+local function whoName(t)
+  if t == nil then return nil end
+  if type(t) == "table" then
+    local n = t.name or t.displayName or t.type
+    if type(n) == "string" then return n end
+    return nil
+  end
+  return tostring(t)
+end
+
+---------------- MONITOR ----------------
+local function draw()
+  if not mon then return end
+  mon.setTextScale(0.5)
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  local w, h = mon.getSize()
+
+  mon.setCursorPos(1, 1)
+  mon.setBackgroundColor(colors.gray)
+  mon.setTextColor(colors.yellow)
+  mon.write(string.rep(" ", w))
+  mon.setCursorPos(2, 1)
+  mon.write("Colony Requests: " .. #shown)
+  mon.setBackgroundColor(colors.black)
+
+  mon.setCursorPos(1, 2)
+  mon.setTextColor(colors.lime)   mon.write("Delivered ")
+  mon.setTextColor(colors.red)    mon.write("Waiting ")
+  mon.setTextColor(colors.orange) mon.write("Manual ")
+  mon.setTextColor(colors.lightGray) mon.write("No item")
+
+  if #shown == 0 then
+    mon.setCursorPos(1, 4)
+    mon.setTextColor(colors.lime)
+    mon.write("No open requests")
+    return
+  end
+
+  local startRow = 4
+  local rowsPer = h - startRow
+  local cols = math.max(1, math.floor(w / 40))
+  local colW = math.floor(w / cols)
+  local perPage = rowsPer * cols
+  local pages = math.max(1, math.ceil(#shown / perPage))
+  if page > pages then page = 1 end
+  if page < 1 then page = pages end
+
+  local first = (page - 1) * perPage
+  for i = 1, perPage do
+    local line = shown[first + i]
+    if not line then break end
+    local c = math.floor((i - 1) / rowsPer)
+    local r = (i - 1) % rowsPer
+    mon.setCursorPos(c * colW + 1, startRow + r)
+    mon.setTextColor(line.color)
+    mon.write(line.text:sub(1, colW - 1))
+  end
+
+  mon.setCursorPos(1, h)
+  mon.setBackgroundColor(colors.gray)
+  mon.setTextColor(colors.white)
+  mon.write(string.rep(" ", w))
+  mon.setCursorPos(2, h)
+  mon.write("<< Prev")
+  local mid = "Page " .. page .. "/" .. pages
+  mon.setCursorPos(math.floor((w - #mid) / 2) + 1, h)
+  mon.write(mid)
+  mon.setCursorPos(w - 6, h)
+  mon.write("Next >>")
+  mon.setBackgroundColor(colors.black)
+end
+
+---------------- AE2 ----------------
+local function meCount(name)
+  local ok, res = pcall(bridge.getItem, { name = name })
+  if ok and type(res) == "table" then return res.amount or res.count or 0 end
+  return 0
+end
+
+local function supply(name, want)
+  local n = math.min(want, meCount(name))
+  if n > 0 then
+    local ok, exported = pcall(bridge.exportItem, { name = name, count = n }, CFG.rackSide)
+    if ok and type(exported) == "number" then return exported end
+  end
+  return 0
+end
+
+local function tryCraft(name, count)
+  local now = os.clock()
+  if lastCraft[name] and now - lastCraft[name] < CFG.craftCooldown then return "waiting" end
+  local ok1, craftable = pcall(bridge.isItemCraftable, { name = name })
+  if not (ok1 and craftable) then return "no pattern" end
+  local ok2, crafting = pcall(bridge.isItemCrafting, { name = name })
+  if ok2 and crafting then return "crafting" end
+  local ok3 = pcall(bridge.craftItem, { name = name, count = math.min(count, CFG.maxCraft) })
+  if ok3 then lastCraft[name] = now return "crafting started" end
+  return "craft failed"
+end
+
+---------------- SCAN ----------------
+local function fmt(status, label, count, who)
+  return string.format("[%s] %dx %s%s", status, count, label, who and (" - " .. who) or "")
+end
+
+local function scan()
+  local ok, requests = pcall(colony.getRequests)
+  if not ok or type(requests) ~= "table" then print("getRequests failed") return end
+
+  if not dumped and requests[1] then
+    local f = fs.open("req_debug.txt", "w")
+    if f then f.write(textutils.serialize(requests[1])) f.close() end
+    dumped = true
+  end
+
+  local active, lines = {}, {}
+  for _, req in ipairs(requests) do
+    local item = req.items and req.items[1]
+    local label = req.name or req.desc
+      or (item and (item.displayName or item.name)) or "Unknown request"
+    local who = whoName(req.target)
+    local id = req.id or label
+    active[id] = true
+    local total = req.count or 1
+    local need = total - (delivered[id] or 0)
+    local text, color
+
+    if not item or not item.name then
+      text, color = fmt("no item", label, total, who), colors.lightGray
+    elseif hasData(item.nbt) or hasData(item.components) then
+      text, color = fmt("manual", label, total, who), colors.orange
+    elseif need <= 0 then
+      text, color = fmt("delivered", label, total, who), colors.lime
+    else
+      local sent = supply(item.name, need)
+      if sent > 0 then
+        delivered[id] = (delivered[id] or 0) + sent
+        need = need - sent
+        print("Sent " .. sent .. "x " .. item.name)
+      end
+      if need <= 0 then
+        text, color = fmt("delivered", label, total, who), colors.lime
+      else
+        local r = tryCraft(item.name, need)
+        text, color = fmt(r, label, need, who), colors.red
+      end
+    end
+    table.insert(lines, { text = text, color = color })
+  end
+
+  for id in pairs(delivered) do
+    if not active[id] then delivered[id] = nil end
+  end
+  shown = lines
+  draw()
+end
+
+---------------- LOOPS ----------------
+local function scanLoop()
+  print("Started.")
+  while true do
+    local ok, err = pcall(scan)
+    if not ok then print("Error: " .. tostring(err)) end
+    sleep(CFG.scanDelay)
+  end
+end
+
+local function touchLoop()
+  while true do
+    local _, _, x, y = os.pullEvent("monitor_touch")
+    if mon then
+      local w, h = mon.getSize()
+      if y == h then
+        if x <= w / 2 then page = page - 1 else page = page + 1 end
+        draw()
+      end
+    end
+  end
+end
+
+parallel.waitForAny(scanLoop, touchLoop)
