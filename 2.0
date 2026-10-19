@@ -1,0 +1,112 @@
+-- AE2 Minecolonies integration 2.0 (basic)
+-- Back to basics: read colony requests -> send from AE2 to the rack -> craft what's missing.
+local VERSION = "AE2 Minecolonies integration 2.0 (basic)"
+local RACK  = "@up"   -- rack sits on TOP of the ME Bridge
+local DELAY = 30      -- seconds between scans
+
+local bridge = peripheral.find("me_bridge")
+local colony = peripheral.find("colony_integrator")
+local mon    = peripheral.find("monitor")
+assert(bridge, "No ME Bridge found")
+assert(colony, "No Colony Integrator found")
+
+local sent = {}   -- request id -> how many we already sent (so we never send twice)
+
+local function stock(name)
+  local ok, it = pcall(bridge.getItem, { name = name })
+  if ok and type(it) == "table" then return it.count or it.amount or 0 end
+  return 0
+end
+
+local function show(lines)
+  if not mon then return end
+  mon.setTextScale(0.5)
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  for i, l in ipairs(lines) do
+    mon.setCursorPos(1, i)
+    mon.setTextColor(l[2])
+    mon.write(l[1])
+  end
+end
+
+local function scan()
+  local lines = { { VERSION .. "   " .. textutils.formatTime(os.time(), true), colors.yellow } }
+
+  local ok, reqs = pcall(colony.getRequests)
+  if not ok or type(reqs) ~= "table" then
+    print("Cannot read colony requests: " .. tostring(reqs))
+    table.insert(lines, { "Cannot read colony requests:", colors.red })
+    table.insert(lines, { tostring(reqs), colors.red })
+    show(lines)
+    return
+  end
+
+  local open = {}
+  for _, r in ipairs(reqs) do
+    local item  = r.items and r.items[1]
+    local name  = item and item.name
+    local id    = r.id or r.name
+    local total = r.count or 1
+    local need  = total - (sent[id] or 0)
+    open[id] = true
+    local status, color
+
+    if not name then
+      status, color = "not an item", colors.lightGray
+    elseif item.nbt then
+      status, color = "hand in", colors.orange       -- special NBT item, do it by hand
+    elseif need <= 0 then
+      status, color = "sent", colors.lime
+    else
+      -- 1) send what AE2 has (never more than the request needs)
+      local have = stock(name)
+      local n = math.min(need, have)
+      local moved = 0
+      if n > 0 then
+        local okE, res, err = pcall(bridge.exportItem, RACK, { name = name, count = n })
+        if type(res) == "number" then moved = res
+        elseif type(res) == "table" then moved = res.count or res.amount or 0 end
+        print("Export " .. n .. "x " .. name .. " -> moved " .. moved ..
+              "  [bridge said: " .. tostring(res) .. " " .. tostring(err or "") .. "]")
+        sent[id] = (sent[id] or 0) + moved
+        need = need - moved
+      end
+
+      -- 2) craft the rest
+      if need <= 0 then
+        status, color = "sent", colors.lime
+      elseif n > 0 and moved == 0 then
+        status, color = "EXPORT FAILED", colors.purple  -- AE2 has it, but the rack took nothing
+      else
+        local _, busy = pcall(bridge.isCrafting, { name = name })
+        local _, can  = pcall(bridge.isCraftable, { name = name })
+        if busy then
+          status, color = "crafting", colors.cyan
+        elseif can then
+          pcall(bridge.craftItem, { name = name, count = need })
+          print("Craft " .. need .. "x " .. name)
+          status, color = "craft started", colors.cyan
+        else
+          status, color = "no pattern", colors.red
+        end
+      end
+    end
+
+    local label = (r.name or (item and item.displayName) or "?"):gsub("[%[%]]", "")
+    local who = type(r.target) == "table" and (r.target.name or "") or tostring(r.target or "")
+    table.insert(lines, { string.format("%-14s %5d  %-40s %s", status, total, label, who), color })
+  end
+
+  for id in pairs(sent) do if not open[id] then sent[id] = nil end end
+  if #reqs == 0 then table.insert(lines, { "No open requests", colors.lime }) end
+  show(lines)
+end
+
+print(VERSION)
+print("Sending to rack: " .. RACK)
+while true do
+  local ok, err = pcall(scan)
+  if not ok then print("Error: " .. tostring(err)) end
+  sleep(DELAY)
+end
