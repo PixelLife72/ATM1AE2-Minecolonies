@@ -1,0 +1,176 @@
+-- AE2 Minecolonies integration 2.3
+-- Sends what the colony needs from AE2 to the block on top of the ME Bridge,
+-- and starts AE2 crafts for anything AE2 doesn't have.
+-- Source of "what is needed":
+--   1) colony requests (normal)
+--   2) builder work orders, if the request list is broken
+--      ("Value must be positive: 0") - no server command needed.
+local VERSION = "AE2 Minecolonies integration 2.3"
+local RACK  = "@up"  -- block on TOP of the ME Bridge
+local DELAY = 30     -- seconds between scans
+local BATCH = 64     -- work orders: max of one item sent per WAIT
+local WAIT  = 300    -- work orders: seconds before the same item is sent again
+
+local bridge = peripheral.find("me_bridge")
+local colony = peripheral.find("colony_integrator")
+local mon    = peripheral.find("monitor")
+assert(bridge, "No ME Bridge found")
+assert(colony, "No Colony Integrator found")
+
+local sent     = {}  -- request id -> amount already sent
+local lastSend = {}  -- work-order item key -> time of last send
+
+local function num(v) return type(v) == "number" and v or 0 end
+
+local function stock(name)
+  local ok, it = pcall(bridge.getItem, { name = name })
+  if ok and type(it) == "table" then return num(it.count or it.amount) end
+  return 0
+end
+
+local function export(name, n)
+  local ok, res, err = pcall(bridge.exportItem, RACK, { name = name, count = n })
+  local moved = 0
+  if type(res) == "number" then moved = res
+  elseif type(res) == "table" then moved = num(res.count or res.amount) end
+  print("Export " .. n .. "x " .. name .. " -> moved " .. moved ..
+        (ok and "" or ("  error: " .. tostring(res))) .. (err and ("  " .. tostring(err)) or ""))
+  return moved
+end
+
+local function craft(name, n)
+  local _, busy = pcall(bridge.isCrafting, { name = name })
+  if busy then return "crafting", colors.cyan end
+  local _, can = pcall(bridge.isCraftable, { name = name })
+  if not can then return "no pattern", colors.red end
+  pcall(bridge.craftItem, { name = name, count = n })
+  print("Craft " .. n .. "x " .. name)
+  return "craft started", colors.cyan
+end
+
+local function show(lines)
+  if not mon then return end
+  mon.setTextScale(0.5)
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  for i, l in ipairs(lines) do
+    mon.setCursorPos(1, i)
+    mon.setTextColor(l[2])
+    mon.write(l[1])
+  end
+end
+
+-- Source 1: colony requests
+local function fromRequests(reqs)
+  local list = {}
+  for _, r in ipairs(reqs) do
+    local item = r.items and r.items[1]
+    local id = r.id or r.name
+    local total = num(r.count); if total == 0 then total = 1 end
+    list[#list + 1] = {
+      id = id, name = item and item.name, nbt = item and item.nbt,
+      total = total, need = total - (sent[id] or 0),
+      label = tostring(r.name or (item and item.displayName) or "?"):gsub("[%[%]]", ""),
+      who = type(r.target) == "table" and (r.target.name or "") or tostring(r.target or ""),
+    }
+  end
+  return list
+end
+
+-- Source 2: builder work orders
+local function fromWorkOrders()
+  local ok, orders = pcall(colony.getWorkOrders)
+  if not ok or type(orders) ~= "table" then return nil, tostring(orders) end
+  local list = {}
+  for _, wo in ipairs(orders) do
+    local okR, res = pcall(colony.getWorkOrderResources, wo.id)
+    if okR and type(res) == "table" then
+      for _, r in ipairs(res) do
+        local it = r.item
+        local name = type(it) == "table" and it.name or (type(it) == "string" and it or nil)
+        local st = tostring(r.status or ""):lower():gsub("[^%a]", "")
+        local short = math.max(0, num(r.needed or r.needs) - num(r.available) - num(r.delivering))
+        if st == "haveenough" or st == "notneeded" then short = 0 end
+        if short > 0 and name then
+          local id = tostring(wo.id) .. "|" .. name
+          local waiting = lastSend[id] and (os.clock() - lastSend[id] < WAIT)
+          list[#list + 1] = {
+            id = id, name = name, nbt = type(it) == "table" and it.nbt or nil, wo = true,
+            total = short, need = waiting and 0 or math.min(short, BATCH),
+            label = tostring(r.displayName or name),
+            who = tostring(wo.buildingName or wo.type or "Builder") ..
+                  (wo.targetLevel and (" L" .. tostring(wo.targetLevel)) or ""),
+          }
+        end
+      end
+    end
+  end
+  return list
+end
+
+local function scan()
+  local lines = { { VERSION .. "   " .. textutils.formatTime(os.time(), true), colors.yellow } }
+
+  local list
+  local ok, reqs = pcall(colony.getRequests)
+  if ok and type(reqs) == "table" then
+    list = fromRequests(reqs)
+  else
+    print("Request list broken: " .. tostring(reqs))
+    local err
+    list, err = fromWorkOrders()
+    if not list then
+      print("Work orders failed too: " .. tostring(err))
+      lines[#lines + 1] = { "Cannot read requests or work orders - retrying", colors.red }
+      lines[#lines + 1] = { tostring(err), colors.orange }
+      show(lines)
+      return
+    end
+    lines[#lines + 1] = { "Request list broken - using builder work orders", colors.yellow }
+  end
+
+  local open = {}
+  for _, r in ipairs(list) do
+    open[r.id] = true
+    local status, color
+    local need = r.need
+
+    if not r.name then
+      status, color = "not an item", colors.lightGray
+    elseif r.nbt or r.name:find("^domum_ornamentum:") then
+      status, color = "hand in", colors.orange
+    elseif need <= 0 then
+      status, color = r.wo and "sent, waiting" or "sent", colors.lime
+    else
+      local n = math.min(need, stock(r.name))
+      local moved = 0
+      if n > 0 then
+        moved = export(r.name, n)
+        sent[r.id] = (sent[r.id] or 0) + moved
+        if r.wo and moved > 0 then lastSend[r.id] = os.clock() end
+        need = need - moved
+      end
+      if need <= 0 then
+        status, color = r.wo and ("sent " .. moved) or "sent", colors.lime
+      elseif n > 0 and moved == 0 then
+        status, color = "EXPORT FAILED", colors.purple  -- AE2 has it, block on top took nothing
+      else
+        status, color = craft(r.name, need)
+      end
+    end
+
+    lines[#lines + 1] = { string.format("%-14s %5d  %-40s %s", status, r.total, r.label, r.who), color }
+  end
+
+  for id in pairs(sent) do if not open[id] then sent[id] = nil end end
+  if #list == 0 then lines[#lines + 1] = { "Nothing needed right now", colors.lime } end
+  show(lines)
+end
+
+print(VERSION)
+print("Sending to: " .. RACK)
+while true do
+  local ok, err = pcall(scan)
+  if not ok then print("Error: " .. tostring(err)) end
+  sleep(DELAY)
+end
