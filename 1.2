@@ -1,0 +1,493 @@
+-- AE2 Minecolonies integration 1.1.2
+-- AE2 -> MineColonies rack supplier (ME Bridge touches rack)
+-- 1.1.1: if colony.getRequests() crashes (e.g. "Value must be positive: 0" from a
+--        stuck request), fall back to reading builder WORK ORDER resources instead.
+-- 1.1.2: fix false "Rack full?" (AE2 recount happened before AE2 refreshed its counts),
+--        export log in colony_log.txt, last export result on monitor, no /mc text.
+local VERSION = "AE2 Minecolonies integration 1.1.2"
+local CFG = {
+  rackSide  = "up",    -- rack sits on TOP of the ME Bridge ("up" = top in Minecraft terms)
+  scanDelay = 20,
+  craftCooldown = 120,
+  maxCraft  = 64,
+  -- work-order fallback only:
+  woBatch   = 64,      -- max of each item sitting in the rack at once (stops the rack flooding)
+  woPendingTimeout = 600, -- seconds before items we sent are assumed used/lost and may be re-sent
+}
+
+local bridge = peripheral.find("me_bridge")
+local mon = peripheral.find("monitor")
+assert(bridge, "No me_bridge found")
+
+local colony
+for _, name in ipairs(peripheral.getNames()) do
+  if peripheral.getType(name) == "colony_integrator" then
+    local p = peripheral.wrap(name)
+    local ok, inCol = pcall(p.isInColony)
+    if ok and inCol then colony = p print("Using " .. name) break end
+  end
+end
+assert(colony, "No colony_integrator inside a colony")
+
+local delivered, lastCraft = {}, {}
+local shown = {}   -- lines currently on the monitor
+local page = 1
+
+---------------- MONITOR ----------------
+-- Pad/cut text to exactly n characters (numbers right-aligned)
+local function cell(v, n, right)
+  local s = tostring(v == nil and "-" or v)
+  if #s > n then s = s:sub(1, n) end
+  if right then return string.rep(" ", n - #s) .. s end
+  return s .. string.rep(" ", n - #s)
+end
+
+local lastScan = "never"
+local mode = "requests"   -- "requests" (normal) or "workorders" (fallback)
+local notice = nil        -- row-3 message: { text = ..., color = ... }
+
+local function draw()
+  if not mon then return end
+  mon.setTextScale(0.5)
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  local w, h = mon.getSize()
+
+  -- counts for the title bar
+  local cnt = { delivered = 0, waiting = 0, manual = 0 }
+  for _, r in ipairs(shown) do cnt[r.group] = (cnt[r.group] or 0) + 1 end
+
+  -- row 1: title bar
+  mon.setCursorPos(1, 1)
+  mon.setBackgroundColor(colors.blue)
+  mon.setTextColor(colors.white)
+  mon.write(string.rep(" ", w))
+  mon.setCursorPos(2, 1)
+  local title = (mode == "workorders") and "BUILDER NEEDS" or "COLONY REQUESTS"
+  mon.write(title .. "  (" .. #shown .. ")   " .. VERSION)
+  local right = "Last scan: " .. lastScan
+  mon.setCursorPos(math.max(1, w - #right), 1)
+  mon.write(right)
+
+  -- row 2: summary chips
+  mon.setCursorPos(1, 2)
+  mon.setBackgroundColor(colors.black)
+  local function chip(txt, bg)
+    mon.setBackgroundColor(bg) mon.setTextColor(colors.black)
+    mon.write(" " .. txt .. " ")
+    mon.setBackgroundColor(colors.black) mon.write(" ")
+  end
+  chip("Delivered " .. cnt.delivered, colors.lime)
+  chip("Waiting " .. cnt.waiting, colors.red)
+  chip("Manual " .. cnt.manual, colors.orange)
+
+  -- row 3: data-source notice (only when not in normal mode)
+  if notice then
+    mon.setCursorPos(1, 3)
+    mon.setBackgroundColor(notice.color)
+    mon.setTextColor(colors.black)
+    mon.write((" " .. notice.text .. string.rep(" ", w)):sub(1, w))
+    mon.setBackgroundColor(colors.black)
+  end
+
+  -- column layout: Item column takes whatever width is left
+  local C = {
+    { key = "status", title = "Status",       w = 16 },
+    { key = "qty",    title = "Need",         w = 5, right = true },
+    { key = "sent",   title = "Sent",         w = 5, right = true },
+    { key = "stock",  title = "In AE2",       w = 7, right = true },
+    { key = "item",   title = "Item",         w = 0 },
+    { key = "who",    title = "Requested By", w = 22 },
+  }
+  if w < 80 then table.remove(C, 6) end          -- small monitor: drop requester
+  local fixed = 0
+  for _, c in ipairs(C) do fixed = fixed + c.w + 1 end
+  for _, c in ipairs(C) do if c.key == "item" then c.w = math.max(10, w - fixed) end end
+
+  local function drawRow(y, values, bg, fg, statusBg)
+    mon.setCursorPos(1, y)
+    for i, c in ipairs(C) do
+      if c.key == "status" and statusBg then
+        mon.setBackgroundColor(statusBg) mon.setTextColor(colors.black)
+      else
+        mon.setBackgroundColor(bg) mon.setTextColor(fg)
+      end
+      mon.write(cell(values[c.key], c.w, c.right))
+      mon.setBackgroundColor(bg)
+      if i < #C then mon.setTextColor(colors.gray) mon.write("|") end
+    end
+    mon.setBackgroundColor(bg)
+    local cx = mon.getCursorPos()
+    if cx <= w then mon.write(string.rep(" ", w - cx + 1)) end
+  end
+
+  -- row 4: header
+  local header = {}
+  for _, c in ipairs(C) do header[c.key] = c.title end
+  drawRow(4, header, colors.lightGray, colors.black)
+
+  if #shown == 0 then
+    mon.setBackgroundColor(colors.black)
+    mon.setCursorPos(2, 6)
+    mon.setTextColor(colors.lime)
+    mon.write(mode == "workorders" and "No builder shortages found in work orders."
+      or "No open requests - colony is fully supplied!")
+    return
+  end
+
+  local startRow = 5
+  local perPage = math.max(1, h - startRow)       -- last row is the page bar
+  local pages = math.max(1, math.ceil(#shown / perPage))
+  if page > pages then page = 1 end
+  if page < 1 then page = pages end
+
+  local first = (page - 1) * perPage
+  for i = 1, perPage do
+    local r = shown[first + i]
+    if not r then break end
+    local bg = (i % 2 == 0) and colors.gray or colors.black   -- zebra stripes
+    drawRow(startRow + i - 1, r, bg, colors.white, r.color)
+  end
+
+  -- page bar (touch the left half = previous, right half = next)
+  mon.setCursorPos(1, h)
+  mon.setBackgroundColor(colors.gray)
+  mon.setTextColor(colors.white)
+  mon.write(string.rep(" ", w))
+  mon.setCursorPos(2, h)
+  mon.write("<< Prev")
+  local mid = "Page " .. page .. "/" .. pages
+  mon.setCursorPos(math.floor((w - #mid) / 2) + 1, h)
+  mon.write(mid)
+  mon.setCursorPos(w - 6, h)
+  mon.write("Next >>")
+  mon.setBackgroundColor(colors.black)
+end
+
+---------------- AE2 ----------------
+-- Advanced Peripherals 0.8 (ATM10) changed the bridge API:
+--   exportItem(target, filter)  target = "@up" (direction) instead of exportItem(filter, "up")
+--   isCraftable / isCrafting    instead of isItemCraftable / isItemCrafting
+-- NEW_API is detected once so the script also still works on older 0.7 versions.
+local NEW_API = type(bridge.isCraftable) == "function"
+print("Bridge API: " .. (NEW_API and "0.8 (new)" or "0.7 (old)"))
+
+local function call(newFn, oldFn, ...)
+  local fn = bridge[NEW_API and newFn or oldFn] or bridge[newFn] or bridge[oldFn]
+  if not fn then return false, "missing method " .. newFn end
+  return pcall(fn, ...)
+end
+
+local function meCount(name)
+  local ok, res = pcall(bridge.getItem, { name = name })
+  if ok and type(res) == "table" then return res.amount or res.count or 0 end
+  return 0
+end
+
+-- Export log: every export attempt + the bridge's raw answer, for diagnosing.
+-- View after stopping the program (Ctrl+T):  edit colony_log.txt   or   pastebin put colony_log.txt
+local LOG_FILE, LOG_MAX = "colony_log.txt", 300
+local logLines = {}
+local lastExport = nil   -- short text of the latest export result (shown on monitor row 3)
+local function logLine(s)
+  table.insert(logLines, textutils.formatTime(os.time(), true) .. " " .. s)
+  while #logLines > LOG_MAX do table.remove(logLines, 1) end
+  local f = fs and fs.open and fs.open(LOG_FILE, "w")
+  if f then f.write(table.concat(logLines, "\n") .. "\n") f.close() end
+end
+local function raw(v)
+  if type(v) ~= "table" then return tostring(v) end
+  local ok, s = pcall(textutils.serialize, v, { compact = true })
+  return ok and s or tostring(v)
+end
+
+-- Exports ONLY what was requested (min of need vs. AE2 stock). Never empties anything.
+-- Returns: moved, problem   (problem = nil when fine, otherwise a short reason)
+local function supply(name, want)
+  local before = meCount(name)
+  local n = math.min(want, before)
+  if n <= 0 then return 0 end
+  print("Exporting " .. n .. "x " .. name .. " -> " .. CFG.rackSide)
+
+  local filter = { name = name, count = n }
+  local ok, res, err
+  if NEW_API then
+    ok, res, err = pcall(bridge.exportItem, "@" .. CFG.rackSide, filter)
+  else
+    ok, res, err = pcall(bridge.exportItem, filter, CFG.rackSide)
+  end
+  local short = name:gsub("^.-:", "")
+  if not ok or res == nil then
+    local why = tostring(err or res)
+    print("  export failed: " .. why)
+    logLine("EXPORT " .. n .. "x " .. name .. " -> FAILED: " .. why)
+    lastExport = short .. ": bridge error: " .. why
+    return 0, "Export error"
+  end
+
+  -- How many moved? Prefer an explicit number from the bridge. Otherwise recount AE2,
+  -- but only after a short wait: AE2 refreshes its item counts once per game tick, so an
+  -- instant recount still shows the OLD number (1.1.1 bug: everything looked "Rack full?").
+  local exported, how
+  if type(res) == "number" then
+    exported, how = res, "bridge number"
+  elseif type(res) == "table" and type(res.count or res.amount or res.transferred) == "number" then
+    exported, how = res.count or res.amount or res.transferred, "bridge table"
+  else
+    sleep(0.25)
+    local after = meCount(name)
+    if after >= before then sleep(0.5) after = meCount(name) end
+    exported, how = math.max(0, math.min(n, before - after)), "AE2 recount " .. before .. "->" .. after
+  end
+  print("  exported " .. exported .. "/" .. n)
+  logLine("EXPORT " .. n .. "x " .. name .. " -> moved " .. exported .. " (" .. how .. ") raw=" .. raw(res))
+  lastExport = short .. ": asked " .. n .. ", moved " .. exported .. " (" .. how .. ")"
+  if exported <= 0 then return 0, "Rack full?" end
+  return exported
+end
+
+local function tryCraft(name, count)
+  local now = os.clock()
+  if lastCraft[name] and now - lastCraft[name] < CFG.craftCooldown then return "waiting" end
+  local ok1, craftable = call("isCraftable", "isItemCraftable", { name = name })
+  if not ok1 then print("  craft check error: " .. tostring(craftable)) return "api error" end
+  if not craftable then return "no pattern" end
+  local ok2, crafting = call("isCrafting", "isItemCrafting", { name = name })
+  if ok2 and crafting then return "crafting" end
+  local ok3, job, err = pcall(bridge.craftItem, { name = name, count = math.min(count, CFG.maxCraft) })
+  if ok3 and job then lastCraft[name] = now return "crafting started" end
+  print("  craft failed: " .. tostring(err or job))
+  return "craft failed"
+end
+
+---------------- SCAN ----------------
+-- sort order on the monitor: things needing attention first
+local ORDER = { waiting = 1, manual = 2, noitem = 3, delivered = 4 }
+
+-- req.target can be a table (shows as "table: 4d..."); pull a readable name out of it
+local function targetName(t)
+  if t == nil then return nil end
+  if type(t) == "table" then
+    return t.name or t.type or t.displayName or nil
+  end
+  return tostring(t)
+end
+
+-- NORMAL MODE: unchanged 1.1 logic, driven by colony.getRequests()
+local function scanRequests(requests)
+  local active, lines = {}, {}
+  for _, req in ipairs(requests) do
+    local item = req.items and req.items[1]
+    local label = req.name or req.desc
+      or (item and (item.displayName or item.name)) or "Unknown request"
+    local who = targetName(req.target)
+    local id = req.id or label
+    active[id] = true
+    local total = req.count or 1
+    local need = total - (delivered[id] or 0)
+    local status, group, color
+
+    if not item or not item.name then
+      status, group, color = "No item", "noitem", colors.lightGray
+    elseif item.nbt then
+      -- true NBT-unique item (enchanted/named/damaged etc.) -> hand it in manually
+      -- NOTE: item.components is MineColonies routing metadata, NOT a reason to skip
+      status, group, color = "Manual", "manual", colors.orange
+    elseif need <= 0 then
+      status, group, color = "Delivered", "delivered", colors.lime
+    else
+      local sent = supply(item.name, need)
+      if sent > 0 then
+        delivered[id] = (delivered[id] or 0) + sent
+        need = need - sent
+        print("Sent " .. sent .. "x " .. item.name)
+      end
+      if need <= 0 then
+        status, group, color = "Delivered", "delivered", colors.lime
+      else
+        local r = tryCraft(item.name, need)
+        status, group, color = r:sub(1, 1):upper() .. r:sub(2), "waiting", colors.red
+      end
+    end
+
+    table.insert(lines, {
+      status = status, group = group, color = color,
+      qty   = total,
+      sent  = delivered[id] or 0,
+      stock = (item and item.name and not item.nbt) and meCount(item.name) or nil,
+      item  = (tostring(label):gsub("^%[", ""):gsub("%]$", "")),   -- strip [brackets]
+      who   = who,
+    })
+  end
+
+  for id in pairs(delivered) do
+    if not active[id] then delivered[id] = nil end
+  end
+  return lines
+end
+
+-- FALLBACK MODE: builder work orders (used only when getRequests() fails)
+-- Safety: per item we track how much WE exported that the colony hasn't counted yet
+-- ("pending"). We never send more than (what the colony still lacks - pending), and
+-- never keep more than CFG.woBatch of one item waiting in the rack.
+local woPending, woOutstanding, woSent, woTime = {}, {}, {}, {}
+
+-- Field names differ between Advanced Peripherals versions; accept both forms.
+local function resItem(r)
+  local it = r.item
+  if type(it) == "table" then return it.name, it.nbt end
+  if type(it) == "string" then return it, nil end
+  return nil, nil
+end
+local function num(v) return type(v) == "number" and v or 0 end
+local function normStatus(s) return (tostring(s or ""):lower():gsub("[^%a]", "")) end
+
+local function scanWorkOrders()
+  local ok, orders = pcall(colony.getWorkOrders)
+  if not ok or type(orders) ~= "table" then return nil, tostring(orders) end
+
+  local lines, seen, unreadable, now = {}, {}, 0, os.clock()
+  for _, wo in ipairs(orders) do
+    local who = wo.buildingName or wo.displayName or wo.type or ("Work order " .. tostring(wo.id))
+    if wo.targetLevel then who = who .. " L" .. tostring(wo.targetLevel) end
+    local okR, res = pcall(colony.getWorkOrderResources, wo.id)
+    if not okR then
+      unreadable = unreadable + 1
+      print("  work order " .. tostring(wo.id) .. " unreadable: " .. tostring(res))
+    elseif type(res) == "table" then
+      for _, r in ipairs(res) do
+        local name, nbt = resItem(r)
+        local needed = num(r.needed or r.needs)
+        local st = normStatus(r.status)
+        local outstanding = math.max(0, needed - num(r.available) - num(r.delivering))
+        if st == "haveenough" or st == "notneeded" then outstanding = 0 end
+
+        local key = tostring(wo.id) .. "|" .. tostring(name)
+        seen[key] = true
+        -- colony's shortage went down since last scan -> our items arrived/were used
+        local prev = woOutstanding[key]
+        if prev and outstanding < prev then
+          woPending[key] = math.max(0, (woPending[key] or 0) - (prev - outstanding))
+        end
+        if woTime[key] and now - woTime[key] > CFG.woPendingTimeout then woPending[key] = 0 end
+        woOutstanding[key] = outstanding
+        local pending = woPending[key] or 0
+
+        local status, group, color
+        if not name then
+          status, group, color = "No item", "noitem", colors.lightGray
+        elseif outstanding <= 0 then
+          status, group, color = "Covered", "delivered", colors.lime
+        elseif nbt or name:find("^domum_ornamentum:") then
+          -- variant stored as item data: bridge can't pick the right one
+          status, group, color = "Manual", "manual", colors.orange
+        elseif st == "indelivery" then
+          status, group, color = "In delivery", "delivered", colors.lightBlue
+        else
+          local want = math.min(outstanding - pending, CFG.woBatch - pending)
+          local problem
+          if want > 0 then
+            local sent
+            sent, problem = supply(name, want)
+            if sent > 0 then
+              pending = pending + sent
+              woPending[key] = pending
+              woSent[key] = (woSent[key] or 0) + sent
+              woTime[key] = now
+              print("Sent " .. sent .. "x " .. name .. " for " .. who)
+            end
+          end
+          if pending >= outstanding then
+            status, group, color = "In rack", "delivered", colors.lime
+          elseif pending >= CFG.woBatch then
+            status, group, color = "Batch in rack", "delivered", colors.cyan
+          elseif problem then
+            -- AE2 had stock but nothing moved: don't craft more, the export is the problem
+            status, group, color = problem, "waiting", colors.purple
+          else
+            local r2 = tryCraft(name, outstanding - pending)
+            status, group, color = r2:sub(1, 1):upper() .. r2:sub(2), "waiting", colors.red
+          end
+        end
+
+        -- only list what still matters (shortages, or things we've sent)
+        if outstanding > 0 or (woSent[key] or 0) > 0 then
+          table.insert(lines, {
+            status = status, group = group, color = color,
+            qty   = outstanding,
+            sent  = woSent[key] or 0,
+            stock = (name and not nbt) and meCount(name) or nil,
+            item  = r.displayName or name or "Unknown",
+            who   = who,
+          })
+        end
+      end
+    end
+  end
+  for k in pairs(woOutstanding) do
+    if not seen[k] then woOutstanding[k], woPending[k], woSent[k], woTime[k] = nil, nil, nil, nil end
+  end
+  return lines, nil, unreadable
+end
+
+local function scan()
+  local ok, requests = pcall(colony.getRequests)
+  local lines
+  if ok and type(requests) == "table" then
+    if mode ~= "requests" then print("getRequests works again - back to normal mode") end
+    mode, notice = "requests", nil
+    lines = scanRequests(requests)
+  else
+    if mode ~= "workorders" then
+      print("getRequests failed: " .. tostring(requests))
+      print("-> Fallback: reading builder work orders instead")
+    end
+    mode = "workorders"
+    local err, unreadable
+    lines, err, unreadable = scanWorkOrders()
+    if lines then
+      local txt = "Request list unreadable: builders only"
+      if unreadable and unreadable > 0 then txt = txt .. " (" .. unreadable .. " orders unreadable)" end
+      if lastExport then txt = txt .. " | Last export: " .. lastExport end
+      notice = { text = txt, color = colors.yellow }
+    else
+      print("getWorkOrders failed too: " .. tostring(err))
+      notice = { text = "Colony not answering (getRequests + getWorkOrders failed) - retrying", color = colors.red }
+      lines = {}
+    end
+  end
+
+  table.sort(lines, function(a, b)
+    if ORDER[a.group] ~= ORDER[b.group] then return ORDER[a.group] < ORDER[b.group] end
+    return a.item < b.item
+  end)
+  shown = lines
+  lastScan = textutils.formatTime(os.time(), true)
+  draw()
+end
+
+---------------- LOOPS ----------------
+local function scanLoop()
+  print(VERSION)
+  print("Started. Exporting to: " .. CFG.rackSide)
+  while true do
+    local ok, err = pcall(scan)
+    if not ok then print("Error: " .. tostring(err)) end
+    sleep(CFG.scanDelay)
+  end
+end
+
+local function touchLoop()
+  while true do
+    local _, _, x, y = os.pullEvent("monitor_touch")
+    if mon then
+      local w, h = mon.getSize()
+      if y == h then
+        if x <= w / 2 then page = page - 1 else page = page + 1 end
+        draw()
+      end
+    end
+  end
+end
+
+parallel.waitForAny(scanLoop, touchLoop)
