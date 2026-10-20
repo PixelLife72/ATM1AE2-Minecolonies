@@ -1,0 +1,469 @@
+-- AE2 Minecolonies integration 2.4
+-- Sends what the colony needs from AE2 to the block on top of the ME Bridge,
+-- and starts AE2 crafts for anything AE2 doesn't have.
+-- Source of "what is needed":
+--   1) colony requests (normal)
+--   2) builder work orders, if the request list is broken
+--      ("Value must be positive: 0") - no server command needed.
+-- 2.4: cosmetic only - spreadsheet-style tables on the monitor and the computer screen.
+-- 2.5: ME Bridge sits UNDER the Warehouse hut block. Every 30 min, SURPLUS items in the
+--      whole warehouse (e.g. blocks from deconstruction) go back into AE2. The computer reads
+--      the warehouse through a wired modem on the hut block. Always keeps KEEP of each item.
+-- 2.6 EXPERIMENTAL: return EVERYTHING that is not on the needed list (KEEP = 0),
+--      including minecolonies: items. Add items to KEEP_ITEM to hold some back.
+local VERSION = "AE2 Minecolonies integration 2.6 exp"
+local RACK  = "@up"  -- block on TOP of the ME Bridge (now the Warehouse hut block)
+local DELAY = 30     -- seconds between scans
+local BATCH = 64     -- work orders: max of one item sent per WAIT
+local WAIT  = 300    -- work orders: seconds before the same item is sent again
+
+-- Return to AE2 (2.5)
+local RETURN_EVERY = 1800  -- seconds between returns (30 min)
+local RETURN_FIRST = 60    -- first return this many seconds after start
+-- Never returned (name patterns). Items with NBT and Domum Ornamentum are never returned either.
+local RETURN_SKIP = { "^domum_ornamentum:" }
+-- Leave this many of each item in the warehouse on top of what is needed. 2.6: 0 = return all.
+local KEEP = 0
+-- Items to hold back anyway (amount to keep), e.g. food for the restaurant:
+--   ["minecraft:bread"] = 64,
+local KEEP_ITEM = {
+}
+-- Name of the warehouse peripheral (yours: "minecolonies:warehouse_1"), or nil to find it
+-- automatically ("warehouse" or "rack" in its name).
+local WAREHOUSE_NAME = nil
+
+local bridge = peripheral.find("me_bridge")
+local colony = peripheral.find("colony_integrator")
+local mon    = peripheral.find("monitor")
+assert(bridge, "No ME Bridge found")
+assert(colony, "No Colony Integrator found")
+
+-- The warehouse (hut block, or a rack), seen through a wired modem (needed to know what's inside).
+-- Prefers the hut block; returns the peripheral and its name.
+local function findRack()
+  if WAREHOUSE_NAME then
+    if peripheral.isPresent(WAREHOUSE_NAME) then return peripheral.wrap(WAREHOUSE_NAME), WAREHOUSE_NAME end
+    return nil
+  end
+  local rackName
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.hasType(name, "inventory") then
+      if name:find("warehouse") then return peripheral.wrap(name), name end
+      if not rackName and name:find("rack") then rackName = name end
+    end
+  end
+  if rackName then return peripheral.wrap(rackName), rackName end
+  return nil
+end
+
+local sent     = {}  -- request id -> amount already sent
+local lastSend = {}  -- work-order item key -> time of last send
+local log      = {}  -- what happened this scan (shown on the computer screen)
+local lastErr        -- last unexpected error (shown on the computer screen)
+local nextReturn = os.clock() + RETURN_FIRST
+local returnInfo = "Return to AE2: not run yet"
+local returnColor = colors.lightGray
+local function returnLine()
+  local left = math.max(0, nextReturn - os.clock())
+  local t = left >= 60 and (math.ceil(left / 60) .. " min") or (math.ceil(left) .. " s")
+  return returnInfo .. " | next in " .. t
+end
+
+local function num(v) return type(v) == "number" and v or 0 end
+
+local function stock(name)
+  local ok, it = pcall(bridge.getItem, { name = name })
+  if ok and type(it) == "table" then return num(it.count or it.amount) end
+  return 0
+end
+
+local function export(name, n, label)
+  local ok, res = pcall(bridge.exportItem, RACK, { name = name, count = n })
+  local moved = 0
+  if type(res) == "number" then moved = res
+  elseif type(res) == "table" then moved = num(res.count or res.amount) end
+  log[#log + 1] = { item = label, asked = n,
+    result = moved > 0 and ("moved " .. moved) or (ok and "FAILED" or "ERROR"),
+    color  = moved > 0 and colors.lime or colors.purple }
+  return moved
+end
+
+local function craft(name, n, label)
+  local _, busy = pcall(bridge.isCrafting, { name = name })
+  if busy then return "crafting", colors.cyan end
+  local _, can = pcall(bridge.isCraftable, { name = name })
+  if not can then return "no pattern", colors.red end
+  pcall(bridge.craftItem, { name = name, count = n })
+  log[#log + 1] = { item = label, asked = n, result = "craft " .. n, color = colors.cyan }
+  return "craft started", colors.cyan
+end
+
+-- ===================== Display (cosmetic only) =====================
+-- Works on both the monitor and the computer screen (same drawing API).
+
+local function fit(s, w, right)
+  s = tostring(s == nil and "" or s)
+  if w <= 0 then return "" end
+  if #s > w then return s:sub(1, w) end
+  local pad = string.rep(" ", w - #s)
+  return right and (pad .. s) or (s .. pad)
+end
+
+local function bar(dev, y, W, text, fg, bg, rightText)
+  dev.setCursorPos(1, y)
+  dev.setBackgroundColor(bg or colors.black)
+  dev.setTextColor(fg or colors.white)
+  rightText = rightText and (rightText .. " ") or ""
+  dev.write(fit(" " .. text, W - #rightText) .. rightText)
+end
+
+-- Give the w = 0 column whatever width is left. Each cell has 1 space padding each side.
+local function layout(defs, W)
+  local cols, used, flex = {}, #defs - 1, nil
+  for i, d in ipairs(defs) do
+    cols[i] = { key = d.key, title = d.title, w = d.w, right = d.right }
+    if d.w == 0 then flex = cols[i] else used = used + d.w end
+  end
+  if flex then flex.w = math.max(4, W - used) end
+  return cols
+end
+
+-- One table row. cellBg = { key = color } paints that cell (black text on it).
+local function row(dev, y, cols, values, bg, fg, cellBg)
+  dev.setCursorPos(1, y)
+  for i, c in ipairs(cols) do
+    local cb = cellBg and cellBg[c.key]
+    dev.setBackgroundColor(cb or bg)
+    dev.setTextColor(cb and colors.black or fg)
+    dev.write(" " .. fit(values[c.key], c.w - 2, c.right) .. " ")
+    if i < #cols then
+      dev.setBackgroundColor(bg)
+      dev.setTextColor(colors.lightGray)
+      dev.write("|")
+    end
+  end
+end
+
+local function header(dev, y, cols)
+  local t = {}
+  for _, c in ipairs(cols) do t[c.key] = c.title end
+  row(dev, y, cols, t, colors.lightGray, colors.black)
+end
+
+-- Problems first, then work in progress, then done.
+local RANK = { ["EXPORT FAILED"] = 1, ["no pattern"] = 2, ["hand in"] = 3,
+               ["craft started"] = 4, ["crafting"] = 5, ["not an item"] = 6 }
+local function rank(s) return RANK[s] or 7 end
+
+-- Footer groups: { label, color, matches(status) }
+local GROUPS = {
+  { "sent",       colors.lime,      function(s) return s:find("^sent") end },
+  { "crafting",   colors.cyan,      function(s) return s:find("craft") end },
+  { "hand in",    colors.orange,    function(s) return s == "hand in" end },
+  { "no pattern", colors.red,       function(s) return s == "no pattern" end },
+  { "failed",     colors.purple,    function(s) return s == "EXPORT FAILED" end },
+}
+
+local function counts(rows)
+  local out = {}
+  for i, g in ipairs(GROUPS) do
+    local n = 0
+    for _, r in ipairs(rows) do if g[3](r.status) then n = n + 1 end end
+    out[i] = { g[1], g[2], n }
+  end
+  return out
+end
+
+local function writeCounts(dev, y, W, rows, prefix, compact)
+  dev.setCursorPos(1, y)
+  dev.setBackgroundColor(colors.black)
+  dev.write(string.rep(" ", W))
+  dev.setCursorPos(1, y)
+  if prefix then dev.setTextColor(colors.yellow) dev.write(" " .. prefix) end
+  for _, c in ipairs(counts(rows)) do
+    if not (compact and c[3] == 0) then   -- small screen: only show non-zero groups
+      dev.setTextColor(c[3] > 0 and c[2] or colors.gray)
+      dev.write(" " .. c[3] .. " " .. c[1] .. (compact and "" or "  "))
+    end
+  end
+end
+
+local MON_COLS = {
+  { key = "status", title = "Status",  w = 15 },
+  { key = "need",   title = "Need",    w = 6, right = true },
+  { key = "sent",   title = "Sent",    w = 6, right = true },
+  { key = "stock",  title = "In AE2",  w = 9, right = true },
+  { key = "item",   title = "Item",    w = 0 },
+  { key = "who",    title = "For",     w = 14 },
+}
+local MON_COLS_NARROW = { MON_COLS[1], MON_COLS[2], MON_COLS[3], MON_COLS[5] }
+
+local function drawMonitor(mode, modeColor, rows, errText)
+  if not mon then return end
+  mon.setTextScale(0.5)
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  local W, H = mon.getSize()
+  bar(mon, 1, W, VERSION, colors.white, colors.blue, textutils.formatTime(os.time(), true))
+  bar(mon, 2, W, mode, modeColor, colors.black)
+  if errText then
+    bar(mon, 4, W, errText, colors.orange, colors.black)
+    return
+  end
+
+  local cols = layout(W >= 70 and MON_COLS or MON_COLS_NARROW, W)
+  header(mon, 3, cols)
+  bar(mon, H - 1, W, returnLine(), returnColor, colors.black)
+  if #rows == 0 then
+    bar(mon, 5, W, "Nothing needed right now", colors.lime, colors.black)
+    return
+  end
+
+  local last = H - 2                      -- keep the return line + footer at the bottom
+  local shown = math.min(#rows, last - 3)
+  for i = 1, shown do
+    local r = rows[i]
+    local bg = (i % 2 == 0) and colors.gray or colors.black
+    row(mon, 3 + i, cols, r, bg, colors.white, { status = r.color })
+  end
+  writeCounts(mon, H, W, rows, #rows > shown and ("+" .. (#rows - shown) .. " more |") or nil, W < 90)
+end
+
+local LOG_COLS = {
+  { key = "item",   title = "This scan",  w = 0 },
+  { key = "asked",  title = "Asked",      w = 7, right = true },
+  { key = "result", title = "Result",     w = 11 },
+}
+
+local function drawConsole(mode, modeColor, rows, errText)
+  mode = mode:gsub("Source: builder work orders %(request list stuck.*", "Work orders (request list stuck)")
+  local W, H = term.getSize()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  bar(term, 1, W, (VERSION:gsub("AE2 Minecolonies integration", "AE2-Colony")), colors.white, colors.blue,
+      textutils.formatTime(os.time(), true))
+  bar(term, 2, W, mode, modeColor, colors.black)
+  local y = 3
+  if errText then bar(term, y, W, errText, colors.orange, colors.black) y = y + 1 end
+  if lastErr then bar(term, y, W, "Error: " .. lastErr, colors.red, colors.black) y = y + 1 end
+  writeCounts(term, y, W, rows, nil, true)
+  bar(term, y + 1, W, (returnLine():gsub("Return to AE2", "Return")), returnColor, colors.black)
+  y = y + 3
+
+  local cols = layout(LOG_COLS, W)
+  header(term, y, cols)
+  if #log == 0 then
+    bar(term, y + 1, W, "Nothing sent or crafted this scan", colors.lightGray, colors.black)
+  end
+  local room = H - y - 1
+  for i = 1, math.min(#log, room) do
+    local e = log[i]
+    row(term, y + i, cols, e, (i % 2 == 0) and colors.gray or colors.black, colors.white,
+        { result = e.color })
+  end
+  if #log > room then
+    bar(term, H, W, "+" .. (#log - room) .. " more", colors.yellow, colors.black)
+  end
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.setCursorPos(1, H)
+end
+
+-- Source 1: colony requests
+local function fromRequests(reqs)
+  local list = {}
+  for _, r in ipairs(reqs) do
+    local item = r.items and r.items[1]
+    local id = r.id or r.name
+    local total = num(r.count); if total == 0 then total = 1 end
+    list[#list + 1] = {
+      id = id, name = item and item.name, nbt = item and item.nbt,
+      total = total, need = total - (sent[id] or 0),
+      label = tostring(r.name or (item and item.displayName) or "?"):gsub("[%[%]]", ""),
+      who = type(r.target) == "table" and (r.target.name or "") or tostring(r.target or ""),
+    }
+  end
+  return list
+end
+
+-- Source 2: builder work orders
+local function fromWorkOrders()
+  local ok, orders = pcall(colony.getWorkOrders)
+  if not ok or type(orders) ~= "table" then return nil, tostring(orders) end
+  local list = {}
+  for _, wo in ipairs(orders) do
+    local okR, res = pcall(colony.getWorkOrderResources, wo.id)
+    if okR and type(res) == "table" then
+      for _, r in ipairs(res) do
+        local it = r.item
+        local name = type(it) == "table" and it.name or (type(it) == "string" and it or nil)
+        local st = tostring(r.status or ""):lower():gsub("[^%a]", "")
+        local short = math.max(0, num(r.needed or r.needs) - num(r.available) - num(r.delivering))
+        if st == "haveenough" or st == "notneeded" then short = 0 end
+        if short > 0 and name then
+          local id = tostring(wo.id) .. "|" .. name
+          local waiting = lastSend[id] and (os.clock() - lastSend[id] < WAIT)
+          list[#list + 1] = {
+            id = id, name = name, nbt = type(it) == "table" and it.nbt or nil, wo = true,
+            total = short, need = waiting and 0 or math.min(short, BATCH),
+            label = tostring(r.displayName or name),
+            who = tostring(wo.buildingName or wo.type or "Builder") ..
+                  (wo.targetLevel and (" L" .. tostring(wo.targetLevel)) or ""),
+          }
+        end
+      end
+    end
+  end
+  return list
+end
+
+-- 2.5: move SURPLUS items from the warehouse back into AE2.
+-- Surplus = what's in the rack minus what open requests / work orders still need.
+local function skipReturn(name)
+  for _, p in ipairs(RETURN_SKIP) do if name:find(p) then return true end end
+  return false
+end
+
+local function importBack(name, n)
+  local total = 0
+  while n > 0 do
+    local ok, res = pcall(bridge.importItem, RACK, { name = name, count = math.min(n, 64) })
+    local moved = 0
+    if type(res) == "number" then moved = res
+    elseif type(res) == "table" then moved = num(res.count or res.amount) end
+    if not ok or moved <= 0 then break end
+    total, n = total + moved, n - moved
+  end
+  return total
+end
+
+local function returnPass(needs)
+  local when = textutils.formatTime(os.time(), true)
+  local rack, rackName = findRack()
+  if not rack then
+    return "Return to AE2: OFF - computer can't see the warehouse (wired modem on hut block needed)", colors.lightGray
+  end
+  local where = rackName:find("warehouse") and "warehouse" or "rack"
+  local ok, slots = pcall(rack.list)
+  if not ok or type(slots) ~= "table" then
+    return "Return to AE2 " .. when .. ": could not read " .. where .. " - " .. tostring(slots), colors.orange
+  end
+
+  -- count what's in the rack, by item (items with NBT are left alone)
+  local inRack = {}
+  for _, it in pairs(slots) do
+    if it.name and not it.nbt and not skipReturn(it.name) then
+      inRack[it.name] = (inRack[it.name] or 0) + num(it.count)
+    end
+  end
+
+  local items, kinds, failed = 0, 0, 0
+  for name, have in pairs(inRack) do
+    local extra = have - (needs[name] or 0) - (KEEP_ITEM[name] or KEEP)
+    if extra > 0 then
+      local moved = importBack(name, extra)
+      local short = name:gsub("^[^:]+:", "")
+      log[#log + 1] = { item = short, asked = extra,
+        result = moved > 0 and ("back " .. moved) or "NOT TAKEN",
+        color = moved > 0 and colors.lightBlue or colors.purple }
+      if moved > 0 then items, kinds = items + moved, kinds + 1 else failed = failed + 1 end
+    end
+  end
+  local msg = "Return to AE2 " .. when .. ": " .. items .. " items (" .. kinds .. " kinds) from " .. where
+  if failed > 0 then msg = msg .. ", " .. failed .. " not taken" end
+  return msg, failed > 0 and colors.orange or colors.lightBlue
+end
+
+local function scan()
+  log = {}
+  local mode, modeColor = "Source: colony requests", colors.lime
+
+  local list
+  local ok, reqs = pcall(colony.getRequests)
+  if ok and type(reqs) == "table" then
+    list = fromRequests(reqs)
+  else
+    local err
+    list, err = fromWorkOrders()
+    if not list then
+      mode, modeColor = "Cannot read requests or work orders - retrying", colors.red
+      drawMonitor(mode, modeColor, {}, tostring(err))
+      drawConsole(mode, modeColor, {}, tostring(err))
+      return
+    end
+    mode, modeColor = "Source: builder work orders (request list stuck - waiting for admin reset)", colors.yellow
+  end
+
+  local open, rows = {}, {}
+  for _, r in ipairs(list) do
+    open[r.id] = true
+    local status, color
+    local need = r.need
+    local have
+
+    if not r.name then
+      status, color = "not an item", colors.lightGray
+    elseif r.nbt or r.name:find("^domum_ornamentum:") then
+      status, color = "hand in", colors.orange
+    elseif need <= 0 then
+      status, color = r.wo and "sent, waiting" or "sent", colors.lime
+    else
+      have = stock(r.name)
+      local n = math.min(need, have)
+      local moved = 0
+      if n > 0 then
+        moved = export(r.name, n, r.label)
+        have = have - moved
+        sent[r.id] = (sent[r.id] or 0) + moved
+        if r.wo and moved > 0 then lastSend[r.id] = os.clock() end
+        need = need - moved
+      end
+      if need <= 0 then
+        status, color = r.wo and ("sent " .. moved) or "sent", colors.lime
+      elseif n > 0 and moved == 0 then
+        status, color = "EXPORT FAILED", colors.purple  -- AE2 has it, block on top took nothing
+      else
+        status, color = craft(r.name, need, r.label)
+      end
+    end
+
+    if have == nil and r.name and status ~= "hand in" then have = stock(r.name) end
+    rows[#rows + 1] = {
+      status = status, color = color, need = r.total, sent = sent[r.id] or 0,
+      stock = have or "-", item = r.label, who = r.who,
+    }
+  end
+
+  for id in pairs(sent) do if not open[id] then sent[id] = nil end end
+
+  -- 2.5: every RETURN_EVERY seconds, send surplus from the rack back to AE2
+  if os.clock() >= nextReturn then
+    local needs = {}
+    for _, r in ipairs(list) do
+      if r.name then needs[r.name] = (needs[r.name] or 0) + num(r.total) end
+    end
+    local okR, msg, color = pcall(returnPass, needs)
+    returnInfo = okR and msg or ("Return to AE2: error - " .. tostring(msg))
+    returnColor = okR and color or colors.red
+    nextReturn = os.clock() + RETURN_EVERY
+  end
+
+  table.sort(rows, function(a, b)
+    if rank(a.status) ~= rank(b.status) then return rank(a.status) < rank(b.status) end
+    if a.who ~= b.who then return a.who < b.who end
+    return a.item < b.item
+  end)
+  drawMonitor(mode, modeColor, rows)
+  drawConsole(mode, modeColor, rows)
+end
+
+term.clear()
+term.setCursorPos(1, 1)
+print(VERSION)
+print("Sending to: " .. RACK .. " - starting first scan...")
+while true do
+  local ok, err = pcall(scan)
+  lastErr = (not ok) and tostring(err) or nil
+  if lastErr then print("Error: " .. lastErr) end
+  sleep(DELAY)
+end
